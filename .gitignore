@@ -1,0 +1,21 @@
+# Environment
+__pycache__/
+*.pyc
+
+# Build and IDE
+build/
+.vscode/
+.idea/
+.vs/
+software/
+
+# Mac OS
+.DS_Store
+
+# Backups and Local Testing
+Software_prev_version/
+*.xlsx
+*.pdf
+
+# Exception for template (if we want to keep it)
+!template.xlsx
