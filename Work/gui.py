@@ -5,12 +5,19 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QMessageBox, QComboBox, 
     QSpinBox, QCheckBox, QGroupBox, QFormLayout, QTableView, QTabWidget,
     QHeaderView, QSplitter, QDoubleSpinBox, QScrollArea, QFrame, QGridLayout,
-    QApplication
+    QApplication, QDialog, QListWidget, QListWidgetItem, QLineEdit
 )
 from PySide6.QtCore import Qt, QAbstractTableModel, QThread, Signal
 from PySide6.QtGui import QFont, QColor, QPixmap, QIcon
 
 from utils import VALID_MEAN_GRADES, GradingError
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    return os.path.join(base_path, relative_path)
 
 # ─── Lazy Import Helpers ────────────────────────────────────────
 # Heavy modules (pandas, matplotlib, numpy, scipy, seaborn, fpdf)
@@ -63,6 +70,43 @@ def _get_report_generator():
         from report_generator import generate_pdf_report as _gen
         _report_generator = _gen
     return _report_generator
+
+class CalculationWorker(QThread):
+    finished = Signal(object, object, bytes, bytes, str)  # df, stats, hist_bytes, bar_bytes, err_msg
+    def __init__(self, df, mappings, weights, max_marks, fail_col, fail_threshold, total_fail_threshold, enable_hard_fail, boundaries, grace_limits):
+        super().__init__()
+        self.df = df
+        self.mappings = mappings
+        self.weights = weights
+        self.max_marks = max_marks
+        self.fail_col = fail_col
+        self.fail_threshold = fail_threshold
+        self.total_fail_threshold = total_fail_threshold
+        self.enable_hard_fail = enable_hard_fail
+        self.boundaries = boundaries
+        self.grace_limits = grace_limits
+
+    def run(self):
+        try:
+            import grading_engine
+            # Dynamically handle backward compatibility if user mixes file versions
+            import inspect
+            sig = inspect.signature(grading_engine.run_grading)
+            kwargs = {
+                "df": self.df, "mappings": self.mappings, "weights": self.weights, 
+                "max_marks": self.max_marks, "fail_col": self.fail_col, 
+                "fail_threshold": self.fail_threshold, "total_fail_threshold": self.total_fail_threshold,
+                "enable_hard_fail": self.enable_hard_fail, "boundaries": self.boundaries
+            }
+            if "grace_limits" in sig.parameters:
+                kwargs["grace_limits"] = self.grace_limits
+            result_df = grading_engine.run_grading(**kwargs)
+            stats = _get_statistics_engine().calculate_stats(result_df, "Total_Score")
+            hist_bytes = _get_graph_generator().generate_hist(result_df) or b""
+            bar_bytes = _get_graph_generator().generate_bar(result_df) or b""
+            self.finished.emit(result_df, stats, hist_bytes, bar_bytes, "")
+        except Exception as e:
+            self.finished.emit(None, None, b"", b"", str(e))
 
 # ─── Theme Colors ───────────────────────────────────────────────
 COLORS = {
@@ -331,7 +375,106 @@ class PandasModel(QAbstractTableModel):
             return str(self._data.columns[col])
         return None
 
+class BestOfDialog(QDialog):
+    def __init__(self, cols, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Create Best Of Column")
+        self.setStyleSheet(STYLESHEET)
+        layout = QVBoxLayout(self)
+        
+        layout.addWidget(QLabel("Select evaluation columns:"))
+        self.list_widget = QListWidget()
+        for c in cols:
+            item = QListWidgetItem(str(c))
+            item.setCheckState(Qt.Unchecked)
+            self.list_widget.addItem(item)
+        layout.addWidget(self.list_widget)
+        
+        layout.addWidget(QLabel("Take the top N scores:"))
+        self.n_spin = QSpinBox()
+        self.n_spin.setRange(1, 20)
+        self.n_spin.setValue(1)
+        layout.addWidget(self.n_spin)
+        
+        layout.addWidget(QLabel("New Column Name:"))
+        self.name_input = QLineEdit()
+        self.name_input.setText("Best_Scores")
+        layout.addWidget(self.name_input)
+        
+        h = QHBoxLayout()
+        btn_ok = QPushButton("Calculate & Add")
+        btn_ok.setObjectName("action")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        h.addWidget(btn_cancel)
+        h.addWidget(btn_ok)
+        layout.addLayout(h)
+
+    def get_data(self):
+        checked_cols = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                checked_cols.append(item.text())
+        return checked_cols, self.n_spin.value(), self.name_input.text().strip()
+
+class GraceDialog(QDialog):
+    def __init__(self, parent=None, current_limits=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Grace Limits")
+        self.resize(300, 400)
+        self.current_limits = current_limits or {g: 0.0 for g in ["A", "A-", "B", "B-", "C", "C-", "D"]}
+        self.spins = {}
+        
+        layout = QVBoxLayout(self)
+        
+        form_layout = QFormLayout()
+        for g in ["A", "A-", "B", "B-", "C", "C-", "D"]:
+            spin = QDoubleSpinBox()
+            spin.setRange(0.0, 100.0)
+            spin.setDecimals(1)
+            spin.setValue(self.current_limits.get(g, 0.0))
+            form_layout.addRow(f"To Grade {g}:", spin)
+            self.spins[g] = spin
+            
+        layout.addLayout(form_layout)
+        
+        btn_layout = QHBoxLayout()
+        btn_save = QPushButton("Save Config")
+        btn_save.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(btn_save)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+        
+    def get_limits(self):
+        return {g: spin.value() for g, spin in self.spins.items()}
+
 class GlassGroup(QWidget):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(18, 18, 18, 18)
+        self.main_layout.setSpacing(12)
+        self.setStyleSheet(f"""
+            GlassGroup {{
+                background-color: rgba(28,34,48,0.6);
+                border: 1px solid {COLORS['card_border']};
+                border-radius: 12px;
+            }}
+        """)
+        lbl = QLabel(title)
+        lbl.setObjectName("sectionTitle")
+        self.main_layout.addWidget(lbl)
+    def addWidget(self, w):
+        self.main_layout.addWidget(w)
+    def addLayout(self, l):
+        self.main_layout.addLayout(l)
+
+class ErrorDialog(QDialog):
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
         self.main_layout = QVBoxLayout(self)
@@ -357,8 +500,8 @@ class GlassGroup(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Relative Grading System — Advanced Enterprise Edition")
-        self.setMinimumSize(1200, 800)
+        self.setWindowTitle("Relative Grading System")
+        self.setWindowIcon(QIcon(resource_path("App Logo.ico")))
         self.resize(1400, 900)
         
         self.df = None
@@ -367,6 +510,7 @@ class MainWindow(QMainWindow):
         
         self.map_combos = {}
         self.weight_spins = {}
+        self.max_spins = {}
         self.boundary_spins = {}
         
         self.setup_ui()
@@ -532,6 +676,11 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_upload)
         self.data_source.addLayout(btn_row)
         
+        self.btn_best_of = QPushButton("✨ Create 'Best Of' Column")
+        self.btn_best_of.setEnabled(False)
+        self.btn_best_of.clicked.connect(self.on_best_of)
+        self.data_source.addWidget(self.btn_best_of)
+
         self.status_label = QLabel("Ready to load data...")
         self.status_label.setObjectName("status")
         self.data_source.addWidget(self.status_label)
@@ -568,6 +717,10 @@ class MainWindow(QMainWindow):
         h3.setObjectName("muted")
         h3.setFixedWidth(100)
         header.addWidget(h3)
+        h4 = QLabel("MAX MARKS")
+        h4.setObjectName("muted")
+        h4.setFixedWidth(80)
+        header.addWidget(h4)
         self.eval_schema.addLayout(header)
         
         self.rows_container = QVBoxLayout()
@@ -588,6 +741,12 @@ class MainWindow(QMainWindow):
         self.grade_combo.addItems(VALID_MEAN_GRADES)
         self.grade_combo.setCurrentText("A-")
         row1.addWidget(self.grade_combo)
+        
+        self.grace_limits_dict = {g: 0.0 for g in ["A", "A-", "B", "B-", "C", "C-", "D"]}
+        self.btn_grace = QPushButton("⚙ Configure Grace Limits")
+        self.btn_grace.clicked.connect(self.open_grace_dialog)
+        row1.addWidget(self.btn_grace)
+        
         row1.addStretch()
         self.grading_params.addLayout(row1)
         
@@ -596,22 +755,37 @@ class MainWindow(QMainWindow):
         self.grading_params.addWidget(self.hard_fail_check)
         
         self.fail_widget = QWidget()
-        fail_layout = QHBoxLayout(self.fail_widget)
+        fail_layout = QVBoxLayout(self.fail_widget)
         fail_layout.setContentsMargins(24, 0, 0, 0)
         fail_layout.setSpacing(8)
-        fail_layout.addWidget(QLabel("If"))
+        
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("If"))
         self.fail_col = QComboBox()
-        fail_layout.addWidget(self.fail_col, 1)
-        fail_layout.addWidget(QLabel("<"))
+        row1.addWidget(self.fail_col, 1)
+        row1.addWidget(QLabel("<"))
         self.fail_threshold = QSpinBox()
         self.fail_threshold.setRange(0, 100)
         self.fail_threshold.setFixedWidth(70)
-        fail_layout.addWidget(self.fail_threshold)
-        arrow = QLabel("→ F")
-        arrow.setObjectName("failArrow")
-        fail_layout.addWidget(arrow)
-        fail_layout.addStretch()
-        self.fail_widget.hide()
+        row1.addWidget(self.fail_threshold)
+        arrow1 = QLabel("→ F")
+        arrow1.setObjectName("failArrow")
+        row1.addWidget(arrow1)
+        row1.addStretch()
+        fail_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("OR If Total Score <"))
+        self.total_fail_threshold = QSpinBox()
+        self.total_fail_threshold.setRange(0, 100)
+        self.total_fail_threshold.setFixedWidth(70)
+        row2.addWidget(self.total_fail_threshold)
+        arrow2 = QLabel("→ F")
+        arrow2.setObjectName("failArrow")
+        row2.addWidget(arrow2)
+        row2.addStretch()
+        fail_layout.addLayout(row2)
+        self.fail_widget.setVisible(self.hard_fail_check.isChecked())
         self.grading_params.addWidget(self.fail_widget)
         
         self.hard_fail_check.toggled.connect(self.fail_widget.setVisible)
@@ -674,6 +848,7 @@ class MainWindow(QMainWindow):
                 
         self.map_combos.clear()
         self.weight_spins.clear()
+        self.max_spins.clear()
         
         count = self.num_spin.value()
         cols = ["[None]"]
@@ -704,8 +879,16 @@ class MainWindow(QMainWindow):
             sb.valueChanged.connect(self.check_weight_sum)
             row_layout.addWidget(sb)
             
+            mb = QDoubleSpinBox()
+            mb.setRange(1, 1000)
+            mb.setValue(100)
+            mb.setDecimals(1)
+            mb.setFixedWidth(80)
+            row_layout.addWidget(mb)
+            
             self.map_combos[comp_name] = cb
             self.weight_spins[comp_name] = sb
+            self.max_spins[comp_name] = mb
             
             self.rows_container.addWidget(row_widget)
             
@@ -768,11 +951,50 @@ class MainWindow(QMainWindow):
                 self.status_label.setObjectName("valid")
                 self.status_label.setStyleSheet(self.status_label.styleSheet())
                 
+                self.btn_best_of.setEnabled(True)
                 self.populate_columns()
                 model = PandasModel(self.df)
                 self.table.setModel(model)
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
+
+    def on_best_of(self):
+        if self.df is None: return
+        numeric_cols = [c for c in self.df.columns if _get_pd().api.types.is_numeric_dtype(self.df[c])]
+        if not numeric_cols:
+            QMessageBox.warning(self, "Error", "No numeric columns available in dataset.")
+            return
+            
+        dlg = BestOfDialog(numeric_cols, self)
+        if dlg.exec() == QDialog.Accepted:
+            cols, n, new_name = dlg.get_data()
+            if not new_name:
+                QMessageBox.warning(self, "Error", "Invalid column name.")
+                return
+            if len(cols) < n:
+                QMessageBox.warning(self, "Error", f"You chose to take the top {n} scores but only selected {len(cols)} columns.")
+                return
+                
+            try:
+                # Sum top n columns row-wise
+                self.df[new_name] = self.df[cols].apply(lambda row: row.nlargest(n).sum(), axis=1)
+                self.populate_columns()
+                self.table.setModel(PandasModel(self.df))
+                QMessageBox.information(self, "Success", f"Column '{new_name}' added successfully!")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to compute: {e}")
+
+    def open_grace_dialog(self):
+        dlg = GraceDialog(self, self.grace_limits_dict)
+        if dlg.exec():
+            self.grace_limits_dict = dlg.get_limits()
+            active_count = sum(1 for v in self.grace_limits_dict.values() if v > 0)
+            if active_count > 0:
+                self.btn_grace.setText(f"⚙ Grace Configured ({active_count} active)")
+                self.btn_grace.setStyleSheet("background: rgba(46, 204, 113, 0.2); color: #2ecc71;")
+            else:
+                self.btn_grace.setText("⚙ Configure Grace Limits")
+                self.btn_grace.setStyleSheet("")
 
     def on_calculate(self):
         if self.df is None:
@@ -786,44 +1008,57 @@ class MainWindow(QMainWindow):
             
         mappings = {comp: cb.currentText() for comp, cb in self.map_combos.items() if cb.currentText() != "[None]"}
         weights = {comp: sb.value() for comp, sb in self.weight_spins.items()}
+        max_marks = {comp: mb.value() for comp, mb in self.max_spins.items()}
         fail_col = self.fail_col.currentText() if self.fail_col.currentText() != "[None]" else None
         fail_threshold = self.fail_threshold.value()
+        total_fail_threshold = self.total_fail_threshold.value()
         enable_hard_fail = self.hard_fail_check.isChecked()
         boundaries = {g: spin.value() for g, spin in self.boundary_spins.items()}
+        grace_limits = self.grace_limits_dict
         
-        try:
-            self.result_df = _get_grading_engine().run_grading(
-                self.df, mappings, weights, fail_col, fail_threshold, enable_hard_fail, boundaries
-            )
-            self.stats = _get_statistics_engine().calculate_stats(self.result_df, "Total_Score")
+        self.btn_calculate.setEnabled(False)
+        self.btn_calculate.setText("⚙ Calculating...")
+        self.worker = CalculationWorker(
+            self.df, mappings, weights, max_marks, 
+            fail_col, fail_threshold, total_fail_threshold, enable_hard_fail, boundaries, grace_limits
+        )
+        self.worker.finished.connect(self.on_calculate_finished)
+        self.worker.start()
+
+    def on_calculate_finished(self, result_df, stats, hist_bytes, bar_bytes, err_msg):
+        self.btn_calculate.setEnabled(True)
+        self.btn_calculate.setText("⚡ Calculate Grades")
+
+        if err_msg:
+            QMessageBox.critical(self, "Calculation Error", err_msg)
+            return
+
+        self.result_df = result_df
+        self.stats = stats
+        
+        # Update Table
+        self.table.setModel(PandasModel(self.result_df))
+        
+        # Update Analytics Stats
+        stats_text = (f"Class Size: {self.stats.get('count',0)}  |  "
+                      f"Mean Score: {self.stats.get('mean',0):.2f}  |  "
+                      f"Std Dev (σ): {self.stats.get('std',0):.2f}")
+        self.lbl_stats.setText(stats_text)
+        self.lbl_stats.setObjectName("text")
+        self.lbl_stats.setStyleSheet(self.lbl_stats.styleSheet())
+        
+        # Update Graphs
+        if hist_bytes:
+            pixmap = QPixmap()
+            pixmap.loadFromData(hist_bytes)
+            self.lbl_hist.setPixmap(pixmap)
             
-            # Update Table
-            self.table.setModel(PandasModel(self.result_df))
+        if bar_bytes:
+            pixmap = QPixmap()
+            pixmap.loadFromData(bar_bytes)
+            self.lbl_bar.setPixmap(pixmap)
             
-            # Update Analytics Stats
-            stats_text = (f"Class Size: {self.stats.get('count',0)}  |  "
-                          f"Mean Score: {self.stats.get('mean',0):.2f}  |  "
-                          f"Std Dev (σ): {self.stats.get('std',0):.2f}")
-            self.lbl_stats.setText(stats_text)
-            self.lbl_stats.setObjectName("text")
-            self.lbl_stats.setStyleSheet(self.lbl_stats.styleSheet())
-            
-            # Update Graphs
-            hist_bytes = _get_graph_generator().generate_hist(self.result_df)
-            if hist_bytes:
-                pixmap = QPixmap()
-                pixmap.loadFromData(hist_bytes)
-                self.lbl_hist.setPixmap(pixmap)
-                
-            bar_bytes = _get_graph_generator().generate_bar(self.result_df)
-            if bar_bytes:
-                pixmap = QPixmap()
-                pixmap.loadFromData(bar_bytes)
-                self.lbl_bar.setPixmap(pixmap)
-                
-            QMessageBox.information(self, "Success", "Grades calculated successfully! Check the Data and Analytics tabs.")
-        except Exception as e:
-            QMessageBox.critical(self, "Calculation Error", str(e))
+        QMessageBox.information(self, "Success", "Grades calculated successfully! Check the Data and Analytics tabs.")
 
     def on_export_excel(self):
         if self.result_df is None:
